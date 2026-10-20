@@ -25,8 +25,6 @@
 
 <br>
 
-<img src="https://komarev.com/ghpvc/?username=dev-praj&style=flat&color=aa9bef&label=profile+views" alt="profile views">
-
 </div>
 
 ---
