@@ -1,0 +1,9 @@
+{
+  "title": "Skills - TODO",
+  "_comment": "Replace these placeholders with verified skills and self-ratings.",
+  "axes": [
+    { "label": "TODO 1", "value": 0 },
+    { "label": "TODO 2", "value": 0 },
+    { "label": "TODO 3", "value": 0 }
+  ]
+}
