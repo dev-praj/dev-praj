@@ -7,7 +7,6 @@ on:
   push:
     branches: [main]
     paths:
-      - "assets/skills.json"
       - "assets/projects.json"
       - "scripts/radar.py"
       - "scripts/cards.py"
@@ -25,10 +24,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      # Hand-authored skill radar (edit assets/skills.json to change it)
-      - name: Skill radar
-        run: python scripts/radar.py --data assets/skills.json -o assets/radar
 
       # GitHub language radar for this profile
       - name: Language radar

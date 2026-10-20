@@ -11,8 +11,9 @@ import html
 import math
 from pathlib import Path
 
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
@@ -28,6 +29,29 @@ LOOP_SECONDS = 14.2
 INTRO_SECONDS = 3.2
 TRAVELLER_COUNT = 900
 SEED = 314159
+
+# Portrait preprocessing controls.
+PORTRAIT_WIDTH = 300
+PORTRAIT_HEIGHT = 340
+DITHER_SCALE = 2
+DITHER_ALGORITHM = "atkinson"
+INVERT = False
+FACE_HEIGHT_FRACTION = 0.55
+FACE_CENTER_Y_FRACTION = 0.47
+FACE_BBOX_OVERRIDE = None
+FACE_DETECT_SCALE_FACTOR = 1.1
+FACE_DETECT_MIN_NEIGHBORS = 5
+FACE_DETECT_MIN_SIZE = (48, 48)
+FACE_MASK_EXPAND_X = 1.35
+FACE_MASK_EXPAND_Y = 1.4
+FACE_MASK_BLUR_RADIUS = 10
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID = (8, 8)
+OUTSIDE_FACE_BRIGHTNESS = 0.92
+TONE_GAMMA = 1.18
+UNSHARP_RADIUS = 1.2
+UNSHARP_PERCENT = 85
+UNSHARP_THRESHOLD = 3
 
 ROWS = [
     ("Subject", "Prajwal"),
@@ -146,44 +170,166 @@ def floyd_steinberg(gray: np.ndarray) -> np.ndarray:
     return out
 
 
+def atkinson(gray: np.ndarray) -> np.ndarray:
+    """Atkinson dithering; True pixels represent highlights."""
+    work = gray.astype(np.float32) / 255.0
+    out = np.zeros_like(work, dtype=bool)
+    height, width = work.shape
+    for y in range(height):
+        for x in range(width):
+            old = work[y, x]
+            new = 1.0 if old >= 0.5 else 0.0
+            out[y, x] = bool(new)
+            error = (old - new) / 8
+            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    work[ny, nx] += error
+    return out
+
+
+def dither(gray: np.ndarray) -> np.ndarray:
+    algorithms = {
+        "floyd-steinberg": floyd_steinberg,
+        "atkinson": atkinson,
+    }
+    try:
+        algorithm = algorithms[DITHER_ALGORITHM]
+    except KeyError as error:
+        raise ValueError(f"Unsupported portrait dithering algorithm: {DITHER_ALGORITHM}") from error
+    return algorithm(gray)
+
+
+def detect_face_bbox(image: Image.Image) -> tuple[int, int, int, int]:
+    if FACE_BBOX_OVERRIDE is not None:
+        return FACE_BBOX_OVERRIDE
+
+    background = Image.new("RGBA", image.size, (96, 96, 96, 255))
+    background.alpha_composite(image)
+    gray = cv2.cvtColor(np.asarray(background.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    cascade = cv2.CascadeClassifier(
+        str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
+    )
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=FACE_DETECT_SCALE_FACTOR,
+        minNeighbors=FACE_DETECT_MIN_NEIGHBORS,
+        minSize=FACE_DETECT_MIN_SIZE,
+    )
+    if len(faces) == 0:
+        raise RuntimeError(
+            "Face detection found no face; set FACE_BBOX_OVERRIDE in generate.py."
+        )
+    x, y, width, height = max(faces, key=lambda box: box[2] * box[3])
+    return int(x), int(y), int(width), int(height)
+
+
+def crop_face(image: Image.Image, face: tuple[int, int, int, int]) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    x, y, face_width, face_height = face
+    target_ratio = PORTRAIT_WIDTH / PORTRAIT_HEIGHT
+    crop_height = min(image.height, face_height / FACE_HEIGHT_FRACTION)
+    crop_width = crop_height * target_ratio
+    if crop_width > image.width:
+        crop_width = float(image.width)
+        crop_height = crop_width / target_ratio
+
+    center_x = x + face_width / 2
+    center_y = y + face_height / 2
+    left = min(max(center_x - crop_width / 2, 0), image.width - crop_width)
+    top = min(max(center_y - crop_height * FACE_CENTER_Y_FRACTION, 0),
+              image.height - crop_height)
+    box = (round(left), round(top), round(left + crop_width), round(top + crop_height))
+    crop = image.crop(box).resize(
+        (PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.LANCZOS
+    )
+    scale_x = PORTRAIT_WIDTH / (box[2] - box[0])
+    scale_y = PORTRAIT_HEIGHT / (box[3] - box[1])
+    crop_face_box = (
+        round((x - box[0]) * scale_x),
+        round((y - box[1]) * scale_y),
+        round(face_width * scale_x),
+        round(face_height * scale_y),
+    )
+    return crop, crop_face_box
+
+
+def preprocess_portrait(image: Image.Image) -> tuple[Image.Image, Image.Image, tuple[int, int, int, int]]:
+    face = detect_face_bbox(image)
+    crop, face_box = crop_face(image, face)
+    gray = ImageOps.grayscale(crop.convert("RGB"))
+    gray_array = np.asarray(gray)
+
+    x, y, face_width, face_height = face_box
+    mask = Image.new("L", crop.size, 0)
+    draw = ImageDraw.Draw(mask)
+    center_x = x + face_width / 2
+    center_y = y + face_height / 2
+    radius_x = face_width * FACE_MASK_EXPAND_X / 2
+    radius_y = face_height * FACE_MASK_EXPAND_Y / 2
+    draw.ellipse(
+        (center_x - radius_x, center_y - radius_y,
+         center_x + radius_x, center_y + radius_y),
+        fill=255,
+    )
+    mask = mask.filter(ImageFilter.GaussianBlur(FACE_MASK_BLUR_RADIUS))
+    face_weight = np.asarray(mask, dtype=np.float32) / 255.0
+
+    clahe = cv2.createCLAHE(
+        clipLimit=CLAHE_CLIP_LIMIT,
+        tileGridSize=CLAHE_TILE_GRID,
+    )
+    local_contrast = clahe.apply(gray_array)
+    blended = gray_array * (1.0 - face_weight) + local_contrast * face_weight
+    blended *= OUTSIDE_FACE_BRIGHTNESS + (
+        1.0 - OUTSIDE_FACE_BRIGHTNESS
+    ) * face_weight
+    curved = np.clip(blended / 255.0, 0.0, 1.0) ** TONE_GAMMA * 255.0
+    prepared = Image.fromarray(np.uint8(np.clip(curved, 0, 255)), "L")
+    prepared = prepared.filter(
+        ImageFilter.UnsharpMask(
+            radius=UNSHARP_RADIUS,
+            percent=UNSHARP_PERCENT,
+            threshold=UNSHARP_THRESHOLD,
+        )
+    )
+    return crop, prepared, face_box
+
+
 def portrait_points(theme: str, rng: np.random.Generator) -> np.ndarray:
     """Return sampled x/y banner coordinates from a 300x340 dither grid."""
     source = ImageOps.exif_transpose(Image.open(SOURCE)).convert("RGBA")
-    crop = ImageOps.fit(source, (300, 340), method=Image.Resampling.LANCZOS)
+    crop, prepared, _ = preprocess_portrait(source)
     rgb = crop.convert("RGB")
     alpha = np.asarray(crop.getchannel("A"), dtype=np.float32) / 255.0
 
     if theme == "dark":
-        lum = np.asarray(ImageOps.grayscale(rgb), dtype=np.float32)
-        prepared = Image.fromarray(np.uint8(np.clip(lum * alpha, 0, 255)), "L")
         select_lit = True
     else:
         white = Image.new("RGBA", crop.size, "white")
         white.alpha_composite(crop)
-        prepared = ImageOps.grayscale(white.convert("RGB"))
+        prepared = Image.composite(prepared, ImageOps.grayscale(white.convert("RGB")),
+                                   Image.fromarray(np.uint8(alpha * 255)))
         select_lit = False
 
-    # Equalize against the subject only (ignore empty alpha) so lit skin vs dark
-    # hair doesn't crush midtones; then punch local contrast for facial edges.
-    if theme == "dark":
-        mask = Image.fromarray(np.uint8((alpha > 0.08) * 255), "L")
-        prepared = ImageOps.equalize(prepared, mask=mask)
-    else:
-        prepared = ImageOps.autocontrast(prepared, cutoff=1)
-    prepared = ImageEnhance.Contrast(prepared).enhance(1.35)
-    prepared = prepared.filter(ImageFilter.UnsharpMask(radius=2, percent=175, threshold=1))
-    bits = floyd_steinberg(np.asarray(prepared))
+    size = (PORTRAIT_WIDTH * DITHER_SCALE, PORTRAIT_HEIGHT * DITHER_SCALE)
+    prepared = prepared.resize(size, Image.Resampling.LANCZOS)
+    alpha = np.asarray(
+        crop.getchannel("A").resize(size, Image.Resampling.LANCZOS),
+        dtype=np.float32,
+    ) / 255.0
+    bits = dither(np.asarray(prepared))
     active = bits if select_lit else ~bits
-    if theme == "dark":
-        active &= alpha > 0.08
+    if INVERT:
+        active = ~active
+    active &= alpha > 0.08
 
-    # Keep the full 300×340 lattice — skipping 2×2 cells was the soft/blurry look.
     ys, xs = np.where(active)
     if len(xs) == 0:
         return np.zeros((0, 2), dtype=np.float32)
-    points = np.column_stack((74 + xs, 154 + ys)).astype(np.float32)
-    if len(points) > 18000:
-        points = points[rng.choice(len(points), 18000, replace=False)]
+    points = np.column_stack((
+        74 + xs / DITHER_SCALE,
+        154 + ys / DITHER_SCALE,
+    )).astype(np.float32)
     return points
 
 
@@ -216,7 +362,7 @@ def point_path(points: np.ndarray) -> str:
     """Aggregate adjacent horizontal one-pixel dots into compact SVG path runs."""
     if not len(points):
         return ""
-    integer = np.rint(points).astype(int)
+    integer = np.rint(points * DITHER_SCALE).astype(int)
     unique = sorted({(int(x), int(y)) for x, y in integer}, key=lambda p: (p[1], p[0]))
     chunks: list[str] = []
     i = 0
@@ -227,7 +373,10 @@ def point_path(points: np.ndarray) -> str:
         while i < len(unique) and unique[i][1] == y and unique[i][0] <= x1 + 1:
             x1 = unique[i][0]
             i += 1
-        chunks.append(f"M{x0} {y}h{x1 - x0 + 1}")
+        chunks.append(
+            f"M{num(x0 / DITHER_SCALE)} {num(y / DITHER_SCALE)}"
+            f"h{num((x1 - x0 + 1) / DITHER_SCALE)}"
+        )
     return "".join(chunks)
 
 
@@ -372,7 +521,7 @@ def render_svg(
             # Small frame telemetry.
             f'<text x="58" y="551" fill="{t["muted"]}" '
             'font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="10">'
-            f'PTS {len(portrait):05d} · FS/SERPENTINE</text>',
+            f'PTS {len(portrait):05d} · {DITHER_ALGORITHM.upper()}</text>',
             # Right information panel.
             f'<rect x="474" y="88" width="672" height="472" rx="6" fill="{t["panel2"]}" '
             f'stroke="{t["line"]}"/>',
